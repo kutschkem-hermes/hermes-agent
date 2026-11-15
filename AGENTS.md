@@ -886,6 +886,28 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 - `error` — only the final message when exit code != 0
 - `off` — no watcher messages at all
 
+**A completion notification is a NEW TURN, not a message.** The watcher injects a synthetic message
+into the session (`gateway/run.py`), so the agent wakes up and re-reads its whole context. That is the
+cost, and it is why a job must have exactly one reader:
+
+- agent reads the result itself → launch **without** `notify_on_complete`, then `process(action='wait')`
+- notification delivers the result → launch **with** `notify_on_complete`, then stop and do not poll
+
+Reading a job whose notification is armed delivers the result twice — once by the agent, once as a
+fresh turn. That is the re-trigger loop.
+
+**Suppression is best-effort and racy.** `gateway/run.py` skips the injection only when
+`process_registry.is_completion_consumed(session_id)` is true, and that flag is set by `poll`/`log`/
+`wait` **only if the session had already exited** when the call was made
+(`tools/process_registry.py`). Two consequences:
+
+- polling a **running** process consumes nothing — the notification still fires;
+- the watcher polls every 5 seconds, so consuming the result after exit can lose the race against
+  an injection that already happened.
+
+This is why the fix belongs in the launch decision (one reader), not in polling discipline after
+the fact.
+
 ---
 
 ## Profiles: Multi-Instance Support

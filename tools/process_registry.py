@@ -1522,7 +1522,11 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "A job has ONE reader: use these actions to read the result yourself (so launch it "
+        "WITHOUT notify_on_complete), or let the completion notification deliver it (so launch it "
+        "WITH notify_on_complete and do not read it here). Reading a job whose notification is armed "
+        "delivers the same result twice — once by you, once as a new turn."
     ),
     "parameters": {
         "type": "object",

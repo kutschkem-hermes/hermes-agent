@@ -904,12 +904,13 @@ Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
-Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
-  (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
-  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
+Background: Set background=true to get a session_id. A background job has exactly ONE reader — decide which BEFORE you launch, because notify_on_complete is not a free message: it is a NEW TURN, and you cannot un-arm it once launched.
+  (1) You will read the result yourself -> background=true and leave notify_on_complete unset, then process(action='wait') for it when you need it. No notification is armed, so no wake is ever delivered and there is no second copy of the result to reconcile.
+  (2) You will NOT read the result yourself -> set notify_on_complete=true and then STOP; the notification IS the delivery. Do not also poll it.
+Never try to cancel a notification by polling: only a poll/wait/log that observes the process AFTER it has exited marks the completion consumed, and the gateway's watcher checks every 5 seconds, so it is a race you can lose. Polling a RUNNING process consumes nothing — the notification still fires.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
-Use process(action="poll") for progress checks, process(action="wait") to block until done.
+Use process(action="poll") for progress checks and process(action="wait") to block until done — on a job you launched WITHOUT notify_on_complete, since polling a job that has one armed is how the result gets delivered twice.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
@@ -1960,27 +1961,28 @@ def terminal_tool(
                     result_data["pty_note"] = pty_disabled_reason
 
                 # Nudge: background=True without notify_on_complete=True OR
-                # watch_patterns is a silent process. The agent has NO way to
-                # learn it finished short of calling process(action="poll"/"wait")
-                # explicitly. That's correct only for genuine long-lived
-                # processes that never exit (servers, watchers). For every
-                # bounded task (tests, builds, CI pollers, deploys, batch
-                # jobs) the agent almost certainly wanted notification and
-                # forgot the flag. May 2026 PR #31231 incident: bg CI poller
-                # ran fine, exited green, agent never noticed — user had to
-                # surface the result. Cheap nudge here costs ~one read for
-                # server cases (false positive) and prevents silent
-                # blindness for bounded-task cases (false negative).
+                # watch_patterns is a silent process — the agent is its ONLY
+                # reader and must call process(action="poll"/"wait") to learn
+                # it finished. That is a legitimate shape (one reader = the
+                # agent), but the agent must know it is now responsible for the
+                # outcome, because nothing else will report it. May 2026 PR
+                # #31231 incident: bg CI poller ran fine, exited green, agent
+                # never noticed — user had to surface the result. The nudge
+                # names BOTH routes (read it yourself, or arm the notification
+                # and stop) because a job has exactly one reader — arming the
+                # notification AND reading the result yourself delivers it
+                # twice, the second time as a new turn.
                 if background and not notify_on_complete and not watch_patterns:
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
                         "this process runs SILENTLY — you will not be told when "
-                        "it exits. If this is a bounded task (test suite, build, "
-                        "CI poller, deploy, anything with a defined end), you "
-                        "almost certainly wanted notify_on_complete=true so the "
-                        "system pings you on exit. Re-launch with "
-                        "notify_on_complete=true, or call process(action='poll') "
-                        "/ process(action='wait') yourself to learn the outcome. "
+                        "it exits, so YOU are its only reader: call "
+                        "process(action='wait') to learn the outcome. If you "
+                        "would rather be told, re-launch with "
+                        "notify_on_complete=true and then do not also poll it. "
+                        "A job has exactly one reader — arming the "
+                        "notification and reading the result yourself delivers "
+                        "it twice, once by you and once as a new turn. "
                         "Only ignore this hint for genuine long-lived processes "
                         "that never exit (servers, watchers, daemons)."
                     )
@@ -2348,7 +2350,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — these MUST set notify_on_complete=true. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. A background job has exactly ONE reader, and you must decide which BEFORE you launch: either you read the result yourself (leave notify_on_complete unset, then use process(action='wait')) or the completion notification delivers it to you (set notify_on_complete=true and then STOP — do not also poll it). notify_on_complete is not a free message: it starts a NEW TURN, and you cannot un-arm it once launched. Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — arm notify_on_complete ONLY if you will not read the output yourself; otherwise poll it and leave the notification unset. For short commands, prefer foreground with a generous timeout instead.",
                 "default": False
             },
             "timeout": {
@@ -2367,7 +2369,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), the completion is delivered to you as a notification that STARTS A NEW TURN — it is not a passive message. Use it only when you will NOT read the result yourself: then STOP after launching and let the notification be the delivery, and do not also poll it. If you WILL read the output (or wait for it) yourself, leave this unset — a job has exactly one reader, and arming the notification as well delivers the same result twice, costing a full turn each time. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {

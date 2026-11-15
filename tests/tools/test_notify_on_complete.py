@@ -503,3 +503,82 @@ def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
     assert "hint" not in result, (
         f"Foreground commands must not emit the background-silence hint, got: {result.get('hint')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# One reader per job — the description guard
+#
+# A completion notification injects a synthetic message into the session
+# (gateway/run.py), so it STARTS A NEW TURN. That is why a background job
+# must have exactly one reader: if the agent both arms the notification and
+# reads the result itself, the same result is delivered twice — once by the
+# agent, once as a fresh turn that re-reads the whole context.
+#
+# These descriptions are the ALWAYS-LOADED surface: they are in the tool
+# schema of every session, whereas the devops skill is opt-in. So the rule
+# has to live here, or an agent that never opens the skill gets the opposite
+# instruction — which is exactly what happened.
+#
+# The guard below is deliberately ABOUT THE TEXT, because the text is the
+# delivery mechanism. It is planted-checked in test_notify_on_complete.py:
+# reverting any one description must fail it.
+# ---------------------------------------------------------------------------
+
+
+def _always_loaded_background_descriptions():
+    """Every surface that tells an agent how to run a background job."""
+    from tools.terminal_tool import TERMINAL_SCHEMA, TERMINAL_TOOL_DESCRIPTION
+    from tools.process_registry import PROCESS_SCHEMA
+
+    props = TERMINAL_SCHEMA["parameters"]["properties"]
+    return {
+        "terminal_tool_description": TERMINAL_TOOL_DESCRIPTION,
+        "schema.background": props["background"]["description"],
+        "schema.notify_on_complete": props["notify_on_complete"]["description"],
+        "process_tool_description": PROCESS_SCHEMA["description"],
+    }
+
+
+class TestOneReaderPerBackgroundJob:
+    """The always-loaded descriptions must teach ONE reader, not two."""
+
+    def test_no_description_tells_the_agent_to_must_arm_notify(self):
+        """The old text said 'MUST set notify_on_complete=true' for bounded
+        tasks. That is half the rule: it never said the notification is a new
+        TURN, so agents armed it AND polled — and got the result twice."""
+        for name, text in _always_loaded_background_descriptions().items():
+            assert "MUST set notify_on_complete" not in text, (
+                f"{name} still mandates the notification without stating the "
+                f"one-reader rule: {text!r}"
+            )
+            assert "Almost always pair with notify_on_complete" not in text, (
+                f"{name} still says 'almost always pair' with the "
+                f"notification: {text!r}"
+            )
+
+    def test_every_description_states_the_one_reader_rule(self):
+        """Each surface must name the rule, so it is findable without
+        loading an opt-in skill."""
+        for name, text in _always_loaded_background_descriptions().items():
+            lowered = text.lower()
+            assert "one reader" in lowered, (
+                f"{name} does not state the one-reader rule: {text!r}"
+            )
+
+    def test_descriptions_state_that_a_notification_is_a_new_turn(self):
+        """The cost is the point. Without it, 'notify' reads as a passive
+        message and gets combined with polling."""
+        for name, text in _always_loaded_background_descriptions().items():
+            lowered = text.lower()
+            assert "new turn" in lowered, (
+                f"{name} does not say the notification starts a new turn: {text!r}"
+            )
+
+    def test_descriptions_do_not_teach_polling_an_armed_job(self):
+        """The old terminal description advertised process(action='poll') for
+        progress checks with no mention of the armed notification — the
+        exact pairing that produced the re-trigger loop."""
+        text = _always_loaded_background_descriptions()["terminal_tool_description"]
+        assert "polling a job that has one armed" in text.lower(), (
+            f"terminal description must warn against polling an armed job: {text!r}"
+        )
