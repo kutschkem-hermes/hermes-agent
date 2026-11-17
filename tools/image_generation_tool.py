@@ -827,7 +827,11 @@ IMAGE_GENERATE_SCHEMA = {
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
-        "![description](url-or-path) and the gateway will deliver it."
+        "![description](url-or-path) and the gateway will deliver it. "
+        "Optionally pass an existing image path in the ``image`` field to "
+        "run img2img refinement at the target resolution. "
+        "For inpainting, provide both ``image`` and ``mask`` — white pixels "
+        "on the mask indicate areas to regenerate, black pixels preserve original."
     ),
     "parameters": {
         "type": "object",
@@ -841,6 +845,40 @@ IMAGE_GENERATE_SCHEMA = {
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "image": {
+                "type": "string",
+                "description": (
+                    "Absolute path to an input image for img2img refinement or inpainting. "
+                    "When provided together with ``mask``, runs inpainting instead of img2img."
+                ),
+            },
+            "strength": {
+                "type": "number",
+                "description": (
+                    "Denoising strength for img2img/inpainting (0.0-1.0). "
+                    "Lower values preserve more of the input image. "
+                    "Typical range: 0.3-0.5 for subtle refinement, 0.6-0.8 for stronger transformation. "
+                    "Defaults to 0.35 for img2img, 0.6 for inpainting."
+                ),
+            },
+            "mask": {
+                "type": "string",
+                "description": (
+                    "Absolute path to a mask image for inpainting. "
+                    "White pixels = areas to regenerate (inpaint). "
+                    "Black pixels = areas to preserve (keep original). "
+                    "Required when ``inpaint`` is true."
+                ),
+            },
+            "inpaint": {
+                "type": "boolean",
+                "description": (
+                    "If true, run inpainting workflow instead of img2img. "
+                    "Requires both ``image`` (source) and ``mask`` to be provided. "
+                    "Uses StableDiffusionXLInpaintPipeline for targeted editing."
+                ),
+                "default": False,
             },
         },
         "required": ["prompt"],
@@ -887,7 +925,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, input_image=None, strength=None, mask=None, inpaint=False):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -944,6 +982,14 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
         kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
         if configured_model:
             kwargs["model"] = configured_model
+        if input_image:
+            kwargs["image"] = input_image
+        if strength is not None:
+            kwargs["strength"] = strength
+        if mask:
+            kwargs["mask"] = mask
+        if inpaint:
+            kwargs["inpaint"] = inpaint
         result = provider.generate(**kwargs)
     except Exception as exc:
         logger.warning(
@@ -971,10 +1017,20 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    input_image = args.get("image") or kw.get("image")
+    strength = args.get("strength") or kw.get("strength")
+    mask = args.get("mask") or kw.get("mask")
+    inpaint = args.get("inpaint") or kw.get("inpaint", False)
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    dispatched = _dispatch_to_plugin_provider(
+        prompt, aspect_ratio,
+        input_image=input_image,
+        strength=strength,
+        mask=mask,
+        inpaint=inpaint,
+    )
     if dispatched is not None:
         return dispatched
 
